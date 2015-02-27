@@ -22,6 +22,8 @@ import time
 import math
 import os
 import tempfile
+import subprocess
+import fcntl
 
 from gi.repository import Gtk
 from gi.repository import GLib
@@ -478,6 +480,7 @@ class SimplePianoActivity(activity.Activity):
 
     def __init__(self, handle):
         activity.Activity.__init__(self, handle)
+        self._pinging = False
         self._what_list = []
 
         self.play_recording_thread = None
@@ -684,7 +687,7 @@ class SimplePianoActivity(activity.Activity):
         self.timeout_ms = 50
         self.instVolume = 50
         self.drumVolume = 0.5
-        self.instrument = 'piano'
+        self.instrument = 'flute'
         self.beat = 4
         self.reverb = 0.1
         self.tempo = PLAYER_TEMPO
@@ -1151,8 +1154,98 @@ class SimplePianoActivity(activity.Activity):
                     self.keyboardStandAlone.do_key_release(
                         LETTERS_TO_KEY_CODES[letter])
 
+    def _pluck(self, letter):
+        """ strike and release a piano key """
+
+        self.keyboardStandAlone.do_key_press(
+            LETTERS_TO_KEY_CODES[letter], None,
+            math.sqrt(self.instVolume * 0.01))
+        self.keyboardStandAlone.do_key_release(
+            LETTERS_TO_KEY_CODES[letter])
+
+    def __pipe_read(self, pipe):
+        """ our pipe has output we can read """
+        text = pipe.read()
+        if text.startswith('PING'):  # header
+            return
+        req = text.count('.')  # an echo request transmitted
+        rep = text.count('\x08 \x08')  # an echo reply received
+        if text.count('ping statistics'):
+            req = 0
+        for x in range(req):
+            keys = 'ZXCVBNMQ'
+            self._pluck(keys[self._echo_requests % len(keys)])
+            self._echo_requests += 1
+        for x in range(rep):
+            keys = 'QWERTYUI'
+            self._pluck(keys[self._echo_replies % len(keys)])
+            self._echo_replies += 1
+
+    def __ping_stop(self):
+        """ stop the ping test """
+
+        self._ping_popen.kill()
+        del self._ping_popen
+        GObject.source_remove(self._pipe_watch_source)
+        self._pinging = False
+
+    def __pipe_hung_up(self):
+        """ our pipe has been broken """
+
+        self.__ping_stop()
+
+    def __pipe_watch_cb(self, pipe, condition):
+        """ handle a condition on the pipe """
+
+        if condition & GLib.IO_IN:
+            self.__pipe_read(pipe)
+            return True  # call us again
+
+        if condition & GLib.IO_HUP:
+            self.__pipe_hung_up()
+            return False  # do not call us again
+
+        return True  # ignore other conditions
+
+    def __ping_start(self):
+        """ start a ping test """
+
+        args = [
+            'ping',
+            '-n',               # do not resolve IP addresses using DNS
+            '-c', '100',        # number of packets
+            '-i', '1.0',        # interval between packets in seconds
+            '-f',               # report using abbreviated output
+            '8.8.8.8',          # use the nearby Google DNS server for test
+        ]
+
+        # create process bound to pipe
+        self._ping_popen = subprocess.Popen(args, stdout=subprocess.PIPE)
+
+        # set the pipe to non-blocking, to avoid buffering
+        fl = fcntl.fcntl(self._ping_popen.stdout, fcntl.F_GETFL, 0)
+        fcntl.fcntl(self._ping_popen.stdout, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+
+        # subscribe to input and hang up events on the file descriptor
+        self._pipe_watch_source = GObject.io_add_watch(self._ping_popen.stdout, GLib.IO_IN | GLib.IO_HUP, self.__pipe_watch_cb)
+
+        self._pinging = True
+        self._echo_requests = 0
+        self._echo_replies = 0
+
+    def ping(self):
+        """ toggle a ping test """
+
+        if self._pinging:
+            self.__ping_stop()
+        else:
+            self.__ping_start()
+
     def onKeyPress(self, widget, event):
         if event.state & Gdk.ModifierType.CONTROL_MASK:
+            return
+        if event.hardware_keycode == 65:  #  space
+            self.ping()
             return
         if event.hardware_keycode == 37:
             if self.muteInst:
@@ -1167,27 +1260,13 @@ class SimplePianoActivity(activity.Activity):
         self.keyboardStandAlone.onKeyRelease(widget, event)
         self.piano.physical_key_changed(event.hardware_keycode, False)
 
+
     ##########################################
     # Journal functions
     ##########################################
 
     def write_file(self, file_path):
-        f = open(file_path, 'w')
-        # substract the initial time to all the saved values
-        if len(self.recorded_keys) > 0:
-            initial_time = self.recorded_keys[0][0]
-            for key in self.recorded_keys:
-                key[0] = key[0] - initial_time
-
-        f.write(json.dumps(self.recorded_keys))
-        f.close()
+        pass
 
     def read_file(self, file_path):
-        f = open(file_path, 'r')
-        contents = f.read().strip()
-
-        self.recorded_keys = json.loads(contents)
-        if len(self.recorded_keys) != 0:
-            self.play_recording_button.set_sensitive(True)
-            self._notes_view.set_recorded_keys(self.recorded_keys)
-        f.close()
+        pass
